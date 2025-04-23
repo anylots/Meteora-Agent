@@ -15,8 +15,8 @@ use {
     log::{debug, error, info},
     once_cell::sync::Lazy,
     serde::{Deserialize, Serialize},
-    solana_sdk::commitment_config::CommitmentConfig,
-    std::{env, fs::File, io::BufReader, sync::Arc, time::Duration},
+    solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey},
+    std::{env, fs::File, io::BufReader, str::FromStr, sync::Arc, time::Duration},
 };
 
 /// Configuration structure for LP wallets
@@ -55,13 +55,19 @@ static LP_WALLETS: Lazy<Vec<String>> = Lazy::new(|| read_lp_wallets_config("conf
 #[tokio::main]
 pub async fn main() -> CarbonResult<()> {
     // Initialize logging and environment variables
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     dotenv::dotenv().ok();
 
     info!("Starting Meteora DLMM transaction processor");
 
-    // Configure transaction crawler
-    let filters = Filters::new(None, None, None);
+    // Convert string wallet addresses to Pubkey objects
+    let lp_pubkeys: Vec<Pubkey> = LP_WALLETS
+        .iter()
+        .filter_map(|addr| Pubkey::from_str(addr).ok())
+        .collect();
+
+    // Configure transaction crawler with LP wallet addresses as account filters
+    let filters = Filters::new(Some(lp_pubkeys), None, None);
     let transaction_crawler = RpcTransactionCrawler::new(
         env::var("RPC_URL").unwrap_or_default(), // RPC URL
         METEORA_PROGRAM_ID,                      // Program ID to monitor
@@ -106,15 +112,21 @@ impl Processor for MeteoraInstructionProcessor {
     ) -> CarbonResult<()> {
         let (_instruction_metadata, decoded_instruction, _nested_instructions) = data;
 
-        debug!(
-            "Decoded instruction data: {}",
+        info!(
+            "Instruction detected, Decoded instruction data: {}",
             serde_json::to_string(&decoded_instruction.data)
                 .unwrap_or("json decode error".to_string())
         );
-
         let transaction_metadata = &_instruction_metadata.transaction_metadata;
+        if let Some(_inner_instructions) = &transaction_metadata.meta.inner_instructions {
+            info!("Transaction signature: {}", transaction_metadata.signature);
+        } else {
+            info!("This transaction has no inner instructions");
+        }
+
         let account_keys = transaction_metadata.message.static_account_keys();
         let fee_payer = transaction_metadata.fee_payer;
+        info!("fee_payer: {}", fee_payer.to_string());
 
         // Check if fee_payer is in LP_WALLETS
         let fee_payer_is_lp = LP_WALLETS
@@ -169,12 +181,6 @@ impl Processor for MeteoraInstructionProcessor {
                     );
                 }
             }
-        }
-
-        if let Some(_inner_instructions) = &transaction_metadata.meta.inner_instructions {
-            info!("Transaction signature: {}", transaction_metadata.signature);
-        } else {
-            info!("This transaction has no inner instructions");
         }
 
         // Helper function to get the instruction name without listing all types
