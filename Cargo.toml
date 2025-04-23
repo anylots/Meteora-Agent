@@ -21,3 +21,6 @@ tokio = { version = "1.42.0", features = ["full"] }
 solana-sdk = "=2.1.16"
 solana-account-decoder = "=2.1.16"
 solana-client = "=2.1.16"
+mpl-token-metadata = "5.1.0"
+borsh = "0.9"  
+thiserror = "1.0"

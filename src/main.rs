@@ -1,7 +1,9 @@
-// Commented imports removed for cleaner code
+mod token;
+mod utils;
 use {
     async_trait::async_trait,
     carbon_core::{
+        deserialize::ArrangeAccounts,
         error::CarbonResult,
         instruction::{DecodedInstruction, InstructionMetadata, NestedInstructions},
         metrics::MetricsCollection,
@@ -9,14 +11,17 @@ use {
     },
     carbon_log_metrics::LogMetrics,
     carbon_meteora_dlmm_decoder::{
-        MeteoraDlmmDecoder, PROGRAM_ID as METEORA_PROGRAM_ID, instructions::MeteoraDlmmInstruction,
+        MeteoraDlmmDecoder, PROGRAM_ID as METEORA_PROGRAM_ID,
+        instructions::{MeteoraDlmmInstruction, add_liquidity::AddLiquidity},
     },
     carbon_rpc_transaction_crawler_datasource::{Filters, RpcTransactionCrawler},
-    log::{debug, error, info},
+    log::{error, info},
     once_cell::sync::Lazy,
     serde::{Deserialize, Serialize},
     solana_sdk::commitment_config::CommitmentConfig,
-    std::{env, fs::File, io::BufReader, sync::Arc, time::Duration},
+    std::{fs::File, io::BufReader, sync::Arc, time::Duration},
+    token::get_token_metadata,
+    utils::SOLANA_RPC,
 };
 
 /// Configuration structure for LP wallets
@@ -63,13 +68,13 @@ pub async fn main() -> CarbonResult<()> {
     // Configure transaction crawler
     let filters = Filters::new(None, None, None);
     let transaction_crawler = RpcTransactionCrawler::new(
-        env::var("RPC_URL").unwrap_or_default(), // RPC URL
-        METEORA_PROGRAM_ID,                      // Program ID to monitor
-        10,                                      // Batch limit
-        Duration::from_secs(5),                  // Polling interval
-        filters,                                 // Filters
-        Some(CommitmentConfig::finalized()),     // Commitment config
-        1,                                       // Max Concurrent Requests
+        SOLANA_RPC.to_string(),              // RPC URL
+        METEORA_PROGRAM_ID,                  // Program ID to monitor
+        10,                                  // Batch limit
+        Duration::from_secs(5),              // Polling interval
+        filters,                             // Filters
+        Some(CommitmentConfig::finalized()), // Commitment config
+        1,                                   // Max Concurrent Requests
     );
 
     info!("Configured transaction crawler for Meteora DLMM program");
@@ -106,7 +111,7 @@ impl Processor for MeteoraInstructionProcessor {
     ) -> CarbonResult<()> {
         let (_instruction_metadata, decoded_instruction, _nested_instructions) = data;
 
-        debug!(
+        info!(
             "Decoded instruction data: {}",
             serde_json::to_string(&decoded_instruction.data)
                 .unwrap_or("json decode error".to_string())
@@ -161,6 +166,27 @@ impl Processor for MeteoraInstructionProcessor {
                     info!("  position: {}", event.position);
                     info!("  amounts: [{}, {}]", event.amounts[0], event.amounts[1]);
                     info!("  active_bin_id: {}", event.active_bin_id);
+                }
+                MeteoraDlmmInstruction::AddLiquidity(_liquidity_parameter) => {
+                    let accounts = AddLiquidity::arrange_accounts(&decoded_instruction.accounts);
+                    if let Some(accounts) = accounts {
+                        info!("AddLiquidity Instruction details:");
+                        let amount_x = _liquidity_parameter.liquidity_parameter.amount_x;
+                        info!("  amount_x: {}", amount_x);
+                        let amount_y = _liquidity_parameter.liquidity_parameter.amount_x;
+                        info!("  amount_y: {}", amount_y);
+
+                        let token_x = accounts.user_token_x;
+                        let token_y = accounts.user_token_y;
+                        // fetch token metadata
+                        if let Ok((_, symbol)) = get_token_metadata(token_x).await {
+                            info!("  symbol_x: {}", symbol);
+                        };
+
+                        if let Ok((_, symbol)) = get_token_metadata(token_y).await {
+                            info!("  symbol_y: {}", symbol);
+                        };
+                    }
                 }
                 _ => {
                     info!(
