@@ -77,18 +77,18 @@ async fn test() {
     // Replace with the Mint address of the SPL Token you want to query
     let mint_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC Mint Address example  
 
-    log::info!("Querying metadata for mint: {}", mint_address);
+    println!("Querying metadata for mint: {}", mint_address);
 
     // --- Execute query ---
     match get_token_metadata(Pubkey::from_str(mint_address).unwrap()).await {
         Ok((name, symbol)) => {
-            log::info!("-------------------------");
-            log::info!("Token Name:   {}", name);
-            log::info!("Token Symbol: {}", symbol);
-            log::info!("-------------------------");
+            println!("-------------------------");
+            println!("Token Name:   {}", name);
+            println!("Token Symbol: {}", symbol);
+            println!("-------------------------");
         }
         Err(e) => {
-            log::error!("Error fetching token metadata: {}", e);
+            eprintln!("Error fetching token metadata: {}", e);
         }
     }
 }

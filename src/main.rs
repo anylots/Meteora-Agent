@@ -1,71 +1,28 @@
+mod message;
+mod processer;
 mod token;
 mod utils;
 use {
-    async_trait::async_trait,
-    carbon_core::{
-        deserialize::ArrangeAccounts,
-        error::CarbonResult,
-        instruction::{DecodedInstruction, InstructionMetadata, NestedInstructions},
-        metrics::MetricsCollection,
-        processor::Processor,
-    },
-    carbon_log_metrics::LogMetrics,
-    carbon_meteora_dlmm_decoder::{
-        MeteoraDlmmDecoder, PROGRAM_ID as METEORA_PROGRAM_ID,
-        instructions::{MeteoraDlmmInstruction, add_liquidity::AddLiquidity},
-    },
+    anyhow::Result,
+    carbon_meteora_dlmm_decoder::{MeteoraDlmmDecoder, PROGRAM_ID as METEORA_PROGRAM_ID},
     carbon_rpc_transaction_crawler_datasource::{Filters, RpcTransactionCrawler},
-    log::{error, info},
-    once_cell::sync::Lazy,
-    serde::{Deserialize, Serialize},
+    log::info,
+    message::TelegramService,
+    processer::MeteoraInstructionProcessor,
     solana_sdk::commitment_config::CommitmentConfig,
-    std::{fs::File, io::BufReader, sync::Arc, time::Duration},
-    token::get_token_metadata,
+    std::{sync::Arc, time::Duration},
     utils::SOLANA_RPC,
 };
 
-/// Configuration structure for LP wallets
-#[derive(Debug, Serialize, Deserialize)]
-struct Config {
-    lp_wallets: Vec<String>,
-}
-
-/// Reads LP wallet addresses from the configuration file
-fn read_lp_wallets_config(config_path: &str) -> Vec<String> {
-    match File::open(config_path) {
-        Ok(file) => {
-            let reader = BufReader::new(file);
-            match serde_json::from_reader::<_, Config>(reader) {
-                Ok(config) => {
-                    info!("Loaded {} LP wallets from config", config.lp_wallets.len());
-                    config.lp_wallets
-                }
-                Err(e) => {
-                    error!("Error parsing config file: {}", e);
-                    Vec::new()
-                }
-            }
-        }
-        Err(e) => {
-            error!("Error opening config file: {}", e);
-            Vec::new()
-        }
-    }
-}
-
-/// Global static collection of LP wallet addresses
-static LP_WALLETS: Lazy<Vec<String>> = Lazy::new(|| read_lp_wallets_config("config.json"));
-
 /// Main application entry point
 #[tokio::main]
-pub async fn main() -> CarbonResult<()> {
-    // Initialize logging and environment variables
-    env_logger::init();
+pub async fn main() -> Result<()> {
+    // Step1. Initialize logging and environment variables
     dotenv::dotenv().ok();
-
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     info!("Starting Meteora DLMM transaction processor");
 
-    // Configure transaction crawler
+    // Step2. Configure transaction crawler
     let filters = Filters::new(None, None, None);
     let transaction_crawler = RpcTransactionCrawler::new(
         SOLANA_RPC.to_string(),              // RPC URL
@@ -76,148 +33,20 @@ pub async fn main() -> CarbonResult<()> {
         Some(CommitmentConfig::finalized()), // Commitment config
         1,                                   // Max Concurrent Requests
     );
-
     info!("Configured transaction crawler for Meteora DLMM program");
 
-    // Build and run the processing pipeline
+    // Step3. Build and run the processing pipeline
     carbon_core::pipeline::Pipeline::builder()
         .datasource(transaction_crawler)
-        .metrics(Arc::new(LogMetrics::new()))
         .metrics_flush_interval(3)
-        .instruction(MeteoraDlmmDecoder, MeteoraInstructionProcessor)
+        .instruction(
+            MeteoraDlmmDecoder,
+            MeteoraInstructionProcessor::new(Arc::new(TelegramService::new())),
+        )
         .build()?
         .run()
         .await?;
 
     info!("Pipeline completed successfully");
     Ok(())
-}
-
-/// Processor for Meteora DLMM instructions
-pub struct MeteoraInstructionProcessor;
-
-#[async_trait]
-impl Processor for MeteoraInstructionProcessor {
-    type InputType = (
-        InstructionMetadata,
-        DecodedInstruction<MeteoraDlmmInstruction>,
-        NestedInstructions,
-    );
-
-    async fn process(
-        &mut self,
-        data: Self::InputType,
-        _metrics: Arc<MetricsCollection>,
-    ) -> CarbonResult<()> {
-        let (_instruction_metadata, decoded_instruction, _nested_instructions) = data;
-
-        info!(
-            "Decoded instruction data: {}",
-            serde_json::to_string(&decoded_instruction.data)
-                .unwrap_or("json decode error".to_string())
-        );
-
-        let transaction_metadata = &_instruction_metadata.transaction_metadata;
-        let account_keys = transaction_metadata.message.static_account_keys();
-        let fee_payer = transaction_metadata.fee_payer;
-
-        // Check if fee_payer is in LP_WALLETS
-        let fee_payer_is_lp = LP_WALLETS
-            .iter()
-            .any(|wallet| wallet == &fee_payer.to_string());
-
-        // Check if any account_key is in LP_WALLETS
-        let mut lp_account_keys = Vec::new();
-        for acc in account_keys {
-            if LP_WALLETS.iter().any(|wallet| wallet == &acc.to_string()) {
-                lp_account_keys.push(acc);
-            }
-        }
-
-        // If fee_payer or any account_key is in LP_WALLETS, log information
-        if fee_payer_is_lp || !lp_account_keys.is_empty() {
-            info!("LP wallet detected in transaction!");
-            info!("Transaction signature: {}", transaction_metadata.signature);
-
-            if fee_payer_is_lp {
-                info!("LP fee_payer: {}", fee_payer);
-            }
-
-            if !lp_account_keys.is_empty() {
-                info!("LP account keys:");
-                for acc in &lp_account_keys {
-                    info!("  - {}", acc);
-                }
-            }
-
-            match &decoded_instruction.data {
-                MeteoraDlmmInstruction::AddLiquidityEvent(event) => {
-                    info!("AddLiquidityEvent details:");
-                    info!("  lb_pair: {}", event.lb_pair);
-                    info!("  from: {}", event.from);
-                    info!("  position: {}", event.position);
-                    info!("  amounts: [{}, {}]", event.amounts[0], event.amounts[1]);
-                    info!("  active_bin_id: {}", event.active_bin_id);
-                }
-                MeteoraDlmmInstruction::RemoveLiquidityEvent(event) => {
-                    info!("RemoveLiquidityEvent details:");
-                    info!("  lb_pair: {}", event.lb_pair);
-                    info!("  from: {}", event.from);
-                    info!("  position: {}", event.position);
-                    info!("  amounts: [{}, {}]", event.amounts[0], event.amounts[1]);
-                    info!("  active_bin_id: {}", event.active_bin_id);
-                }
-                MeteoraDlmmInstruction::AddLiquidity(_liquidity_parameter) => {
-                    let accounts = AddLiquidity::arrange_accounts(&decoded_instruction.accounts);
-                    if let Some(accounts) = accounts {
-                        info!("AddLiquidity Instruction details:");
-                        let amount_x = _liquidity_parameter.liquidity_parameter.amount_x;
-                        info!("  amount_x: {}", amount_x);
-                        let amount_y = _liquidity_parameter.liquidity_parameter.amount_x;
-                        info!("  amount_y: {}", amount_y);
-
-                        let token_x = accounts.user_token_x;
-                        let token_y = accounts.user_token_y;
-                        // fetch token metadata
-                        if let Ok((_, symbol)) = get_token_metadata(token_x).await {
-                            info!("  symbol_x: {}", symbol);
-                        };
-
-                        if let Ok((_, symbol)) = get_token_metadata(token_y).await {
-                            info!("  symbol_y: {}", symbol);
-                        };
-                    }
-                }
-                _ => {
-                    info!(
-                        "Instruction type: {}",
-                        get_instruction_name(&decoded_instruction.data)
-                    );
-                }
-            }
-        }
-
-        if let Some(_inner_instructions) = &transaction_metadata.meta.inner_instructions {
-            info!("Transaction signature: {}", transaction_metadata.signature);
-        } else {
-            info!("This transaction has no inner instructions");
-        }
-
-        // Helper function to get the instruction name without listing all types
-        fn get_instruction_name(instruction: &MeteoraDlmmInstruction) -> String {
-            match instruction {
-                MeteoraDlmmInstruction::AddLiquidityEvent(_) => "AddLiquidityEvent".to_string(),
-                MeteoraDlmmInstruction::RemoveLiquidityEvent(_) => {
-                    "RemoveLiquidityEvent".to_string()
-                }
-                _ => format!("{:?}", instruction)
-                    .split("(")
-                    .next()
-                    .unwrap_or("Unknown")
-                    .to_string(),
-            }
-        }
-
-        Ok(())
-    }
 }
